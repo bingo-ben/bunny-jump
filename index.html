@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no,viewport-fit=cover">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
+<title>蹦蹦跳大冒险 v1</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{width:100%;height:100%;overflow:hidden;background:#1a1a2e;touch-action:manipulation;overscroll-behavior:none;user-select:none;-webkit-user-select:none}
+canvas{display:block}
+#ui{position:fixed;bottom:0;left:0;right:0;display:flex;justify-content:space-between;padding:10px 16px 16px;gap:8px;pointer-events:none}
+.btn{width:68px;height:68px;border-radius:50%;border:3px solid rgba(255,255,255,.35);background:rgba(255,255,255,.2);color:#fff;font-size:30px;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(4px);pointer-events:auto}
+.btn:active{background:rgba(255,255,255,.45);transform:scale(.9)}
+#overlay{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.7);z-index:10;justify-content:center;align-items:center;flex-direction:column}
+#overlay.active{display:flex}
+#overlay h2{color:#fff;font-size:38px;margin-bottom:12px;text-shadow:0 2px 8px rgba(0,0,0,.5)}
+#overlay p{color:#ddd;font-size:20px;margin-bottom:24px;text-align:center;line-height:1.6;white-space:pre-line}
+#overlay button{padding:16px 48px;font-size:22px;border-radius:32px;border:none;background:#FF6B35;color:#fff;font-weight:700;cursor:pointer;-webkit-tap-highlight-color:transparent}
+#overlay button:active{background:#E55A2B}
+#scorebar{position:fixed;top:12px;left:0;right:0;text-align:center;pointer-events:none;z-index:5}
+#scorebar span{background:rgba(0,0,0,.45);color:#FFD700;padding:6px 20px;border-radius:20px;font-size:20px;font-weight:700;backdrop-filter:blur(4px)}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="scorebar"><span>🏆 <span id="score">0</span></span></div>
+<div id="ui">
+  <button class="btn" id="btn-left">◀</button>
+  <button class="btn" id="btn-right">▶</button>
+</div>
+<div id="overlay">
+  <h2 id="ov-title">🐰 蹦蹦跳大冒险</h2>
+  <p id="ov-msg">一直往上跳，别掉下去！</p>
+  <button id="ov-btn">开始游戏</button>
+</div>
+<script>
+// ========== AUDIO ==========
+let audioCtx;
+function initAudio(){if(!audioCtx)audioCtx=new(window.AudioContext||window.webkitAudioContext)()}
+function beep(f,dur,type='square',vol=0.08){
+  if(!audioCtx)return;
+  const o=audioCtx.createOscillator(),g=audioCtx.createGain();
+  o.type=type;o.frequency.value=f;g.gain.setValueAtTime(vol,audioCtx.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.001,audioCtx.currentTime+dur);
+  o.connect(g);g.connect(audioCtx.destination);o.start();o.stop(audioCtx.currentTime+dur);
+}
+function sfx(s){
+  if(s==='jump'){beep(500,0.1,'triangle',0.12);setTimeout(()=>beep(700,0.08,'sine',0.08),60)}
+  else if(s==='bounce'){beep(800,0.08,'square',0.15);beep(1000,0.06,'sine',0.1)}
+  else if(s==='break'){beep(200,0.2,'sawtooth',0.12);setTimeout(()=>beep(120,0.15,'triangle',0.1),50)}
+  else if(s==='spring'){beep(300,0.05,'square',0.18);beep(600,0.05,'square',0.18);beep(900,0.05,'square',0.18)}
+  else if(s==='die'){beep(60,0.6,'sawtooth',0.15);setTimeout(()=>beep(40,0.4,'triangle',0.1),200)}
+  else if(s==='land')beep(180,0.04,'sine',0.06);
+}
+
+// ========== CANVAS ==========
+const C=document.getElementById('c'),ctx=C.getContext('2d');
+const W=400,H=700;
+let cw,ch,scale;
+function resize(){
+  const maxW=Math.min(window.innerWidth,500),maxH=Math.min(window.innerHeight,900);
+  scale=Math.min(maxW/W,maxH/H);
+  cw=W*scale;ch=H*scale;
+  C.width=W;C.height=H;C.style.width=cw+'px';C.style.height=ch+'px';
+}
+resize();window.addEventListener('resize',resize);
+
+// ========== GAME STATE ==========
+const GRAVITY=0.45,MAX_DY=9,SPEED=4.5,JUMP_FORCE=-10.5;
+let bunny={x:200,y:300,dx:0,dy:0,w:36,h:40,face:1,onPlatform:false,walkFrame:0};
+let cameraY=0,score=0,highScore=0,minY=300,gameState='title',keys={},btns={left:false,right:false};
+let platforms=[],stars=[],particles=[],gameFrame=0,starFrame=0;
+
+// Platform types
+const PTYPE={NORMAL:0,BREAK:1,SPRING:2,MOVE:3};
+const PCOLOR={
+  [PTYPE.NORMAL]:['#8BC34A','#689F38'],
+  [PTYPE.BREAK]:['#FF7043','#D84315'],
+  [PTYPE.SPRING]:['#FFCA28','#FF8F00'],
+  [PTYPE.MOVE]:['#42A5F5','#1565C0'],
+};
+
+function rand(min,max){return Math.random()*(max-min)+min}
+function randInt(min,max){return Math.floor(Math.random()*(max-min+1))+min}
+
+// ========== PLATFORM GENERATION ==========
+function generatePlatforms(count,startY){
+  const ps=[];
+  // Ground platform at the very bottom
+  ps.push({x:W/2-60,y:startY+30,w:120,h:14,type:PTYPE.NORMAL,broken:false,moveDir:0,moveRange:0,startX:0});
+  // Generate platforms going upward
+  for(let i=1;i<count;i++){
+    const y=startY-i*(H/15+rand(-5,5));
+    const w=rand(60,110);
+    const x=rand(10,W-w-10);
+    let type=PTYPE.NORMAL;
+    const r=Math.random();
+    if(i>3&&r<0.12)type=PTYPE.BREAK;
+    else if(i>5&&r<0.22)type=PTYPE.SPRING;
+    else if(i>7&&r<0.32)type=PTYPE.MOVE;
+    ps.push({x,y,w,h:14,type,broken:false,
+      moveDir:type===PTYPE.MOVE?(Math.random()>0.5?1:-1):0,
+      moveRange:type===PTYPE.MOVE?rand(40,80):0,
+      startX:x
+    });
+  }
+  return ps;
+}
+
+function ensurePlatforms(){
+  // Remove platforms that are far below screen
+  platforms=platforms.filter(p=>p.y-cameraY<H+200);
+  // Add new platforms at the top
+  const topY=platforms.reduce((min,p)=>Math.min(min,p.y),Infinity);
+  while(topY-cameraY>-200){
+    const y=topY-rand(45,70);
+    const w=rand(55,105);
+    const x=rand(10,W-w-10);
+    let type=PTYPE.NORMAL;
+    const r=Math.random();
+    if(score>500&&r<0.12)type=PTYPE.BREAK;
+    else if(score>800&&r<0.22)type=PTYPE.SPRING;
+    else if(score>300&&r<0.32)type=PTYPE.MOVE;
+    platforms.unshift({x,y,w,h:14,type,broken:false,
+      moveDir:type===PTYPE.MOVE?(Math.random()>0.5?1:-1):0,
+      moveRange:type===PTYPE.MOVE?rand(40,80):0,
+      startX:x
+    });
+  }
+}
+
+// ========== DRAWING ==========
+function drawBunny(x,y,w,h,face,walkFrame,dead){
+  const cx=x+w/2,cy=y+h/2;
+  ctx.save();ctx.translate(cx,cy);
+  if(dead){
+    ctx.fillStyle='#FFE0E0';ctx.beginPath();ctx.arc(0,0,w*0.4,0,Math.PI*2);ctx.fill();
+    ctx.fillStyle='#000';ctx.beginPath();ctx.arc(-4,-3,2,0,Math.PI*2);ctx.fill();
+    ctx.beginPath();ctx.arc(4,-3,2,0,Math.PI*2);ctx.fill();
+    ctx.strokeStyle='#999';ctx.lineWidth=1.5;
+    ctx.beginPath();ctx.moveTo(-6,4);ctx.quadraticCurveTo(0,10,6,4);ctx.stroke();
+    ctx.restore();return;
+  }
+  // Body
+  ctx.fillStyle='#FFF';ctx.beginPath();ctx.ellipse(0,2,w*0.38,h*0.42,0,0,Math.PI*2);ctx.fill();
+  ctx.strokeStyle='#DDD';ctx.lineWidth=1.2;ctx.stroke();
+  // Head
+  ctx.fillStyle='#FFF';ctx.beginPath();ctx.arc(0,-h*0.22,w*0.35,0,Math.PI*2);ctx.fill();
+  ctx.strokeStyle='#DDD';ctx.stroke();
+  // Long ears
+  ctx.fillStyle='#FFF';
+  ctx.beginPath();ctx.ellipse(-w*0.14,-h*0.42,w*0.1,h*0.22,0,0,Math.PI*2);ctx.fill();
+  ctx.strokeStyle='#DDD';ctx.stroke();
+  ctx.beginPath();ctx.ellipse(w*0.14,-h*0.42,w*0.1,h*0.22,0,0,Math.PI*2);ctx.fill();
+  ctx.stroke();
+  // Inner ear
+  ctx.fillStyle='#FFCCD5';
+  ctx.beginPath();ctx.ellipse(-w*0.14,-h*0.4,w*0.06,h*0.16,0,0,Math.PI*2);ctx.fill();
+  ctx.beginPath();ctx.ellipse(w*0.14,-h*0.4,w*0.06,h*0.16,0,0,Math.PI*2);ctx.fill();
+  // Eyes
+  ctx.fillStyle='#333';ctx.beginPath();ctx.arc(-w*0.12,-h*0.24,w*0.08,0,Math.PI*2);ctx.fill();
+  ctx.beginPath();ctx.arc(w*0.12,-h*0.24,w*0.08,0,Math.PI*2);ctx.fill();
+  ctx.fillStyle='#fff';ctx.beginPath();ctx.arc(-w*0.1,-h*0.26,w*0.03,0,Math.PI*2);ctx.fill();
+  ctx.beginPath();ctx.arc(w*0.14,-h*0.26,w*0.03,0,Math.PI*2);ctx.fill();
+  // Nose
+  ctx.fillStyle='#FF9999';ctx.beginPath();ctx.moveTo(0,-h*0.16);ctx.lineTo(-3,-h*0.13);ctx.lineTo(3,-h*0.13);ctx.closePath();ctx.fill();
+  // Whiskers
+  ctx.strokeStyle='#CCC';ctx.lineWidth=0.5;
+  for(let s=-1;s<=1;s+=2){
+    ctx.beginPath();ctx.moveTo(s*w*0.1,-h*0.14);ctx.lineTo(s*w*0.25,-h*0.16);ctx.stroke();
+    ctx.beginPath();ctx.moveTo(s*w*0.1,-h*0.11);ctx.lineTo(s*w*0.25,-h*0.1);ctx.stroke();
+  }
+  // Tail
+  ctx.fillStyle='#FFF';ctx.beginPath();ctx.arc(-w*0.36,4,6,0,Math.PI*2);ctx.fill();
+  ctx.strokeStyle='#DDD';ctx.stroke();
+  ctx.restore();
+}
+
+function drawPlatform(p,drawY){
+  const x=p.x, y=drawY;
+  const [main,dark]=PCOLOR[p.type];
+  // Main body
+  ctx.fillStyle=main;
+  ctx.beginPath();ctx.roundRect(x,y,p.w,p.h,6);ctx.fill();
+  // Top highlight
+  ctx.fillStyle=dark;
+  ctx.beginPath();ctx.roundRect(x,y,p.w,p.h/2,[6,6,0,0]);ctx.fill();
+  // Edge dots
+  ctx.fillStyle='rgba(255,255,255,.4)';
+  for(let dx=8;dx<p.w-8;dx+=16){
+    ctx.beginPath();ctx.arc(x+dx,y+3,2.5,0,Math.PI*2);ctx.fill();
+  }
+  // Special effects
+  if(p.type===PTYPE.BREAK&&!p.broken){
+    ctx.strokeStyle='rgba(0,0,0,.2)';ctx.lineWidth=1;ctx.setLineDash([3,4]);
+    ctx.beginPath();ctx.moveTo(x+5,y+p.h/2);ctx.lineTo(x+p.w-5,y+p.h/2);ctx.stroke();
+    ctx.setLineDash([]);
+  }
+  if(p.type===PTYPE.SPRING){
+    ctx.fillStyle='#FFF';ctx.beginPath();ctx.arc(x+p.w/2,y-1,5,0,Math.PI);ctx.fill();
+    ctx.fillStyle=dark;ctx.beginPath();ctx.arc(x+p.w/2-6,y-5,3,0,Math.PI*2);ctx.fill();
+    ctx.beginPath();ctx.arc(x+p.w/2+6,y-5,3,0,Math.PI*2);ctx.fill();
+  }
+  if(p.type===PTYPE.MOVE){
+    ctx.strokeStyle='rgba(255,255,255,.6)';ctx.lineWidth=2;
+    ctx.beginPath();ctx.moveTo(x+4,y+2);ctx.lineTo(x+p.w-4,y+2);ctx.stroke();
+    ctx.beginPath();ctx.moveTo(x+4,y+p.h-2);ctx.lineTo(x+p.w-4,y+p.h-2);ctx.stroke();
+  }
+}
+
+function drawStars(){
+  ctx.fillStyle='#fff';
+  stars.forEach(s=>{
+    const twinkle=Math.sin(starFrame*0.03+s.x)*0.4+0.6;
+    ctx.globalAlpha=twinkle;
+    ctx.beginPath();ctx.arc(s.x,s.y-cameraY*0.2,s.r,0,Math.PI*2);ctx.fill();
+  });
+  ctx.globalAlpha=1;
+  starFrame++;
+}
+
+// ========== PARTICLE EFFECTS ==========
+function spawnParticles(x,y,color,count){
+  for(let i=0;i<count;i++){
+    particles.push({
+      x,y,vx:rand(-3,3),vy:rand(-5,-1),
+      life:30+rand(0,20),maxLife:50,color,size:rand(2,5)
+    });
+  }
+}
+
+function updateParticles(){
+  particles=particles.filter(p=>{p.life--;p.x+=p.vx;p.y+=p.vy;p.vy+=0.1;return p.life>0});
+}
+
+// ========== GAME LOOP ==========
+function update(){
+  if(gameState!=='playing')return;
+  gameFrame++;
+  const b=bunny;
+
+  // Movement
+  let moveDir=0;
+  if(keys['ArrowLeft']||keys['a']||btns.left)moveDir=-1;
+  if(keys['ArrowRight']||keys['d']||btns.right)moveDir=1;
+  if(moveDir!==0)b.face=moveDir;
+  b.dx=moveDir*SPEED;
+
+  // Physics
+  b.dy+=GRAVITY;if(b.dy>MAX_DY)b.dy=MAX_DY;
+  b.x+=b.dx;b.y+=b.dy;
+  if(b.x<0)b.x=0;if(b.x+b.w>W)b.x=W-b.w;
+
+  // Update moving platforms
+  platforms.forEach(p=>{
+    if(p.type!==PTYPE.MOVE)return;
+    p.x+=p.moveDir*1.2;
+    if(p.x>p.startX+p.moveRange){p.moveDir=-1}
+    if(p.x<p.startX-p.moveRange){p.moveDir=1}
+  });
+
+  // Platform collision (all in world space)
+  b.onPlatform=false;
+  for(let p of platforms){
+    if(p.broken)continue;
+    if(b.dy<0)continue; // Only check when falling
+    if(b.x+b.w-8>p.x||b.x+8<p.x+p.w)continue;
+    // Bunny bottom must be near platform top (world coords)
+    if(b.y+b.h>=p.y&&b.y+b.h-b.dy<=p.y+10){
+      // Land on platform
+      b.y=p.y-b.h;b.dy=0;b.onPlatform=true;
+      sfx('land');
+
+      if(p.type===PTYPE.BREAK){
+        p.broken=true;
+        sfx('break');
+        spawnParticles(b.x+b.w/2,b.y+b.h,'#FF7043',8);
+        b.dy=JUMP_FORCE*0.7;
+      }else if(p.type===PTYPE.SPRING){
+        sfx('spring');
+        spawnParticles(b.x+b.w/2,b.y+b.h,'#FFCA28',6);
+        b.dy=JUMP_FORCE*1.6;
+        b.onPlatform=false;
+      }else{
+        b.dy=JUMP_FORCE;
+        sfx('jump');
+      }
+      break;
+    }
+  }
+
+  // Camera
+  const targetCY=b.y-H*0.4;
+  if(targetCY<cameraY)cameraY+=(targetCY-cameraY)*0.15;
+
+  // Score — track highest point reached
+  if(b.y<minY)minY=b.y;
+  score=Math.floor((300-minY)/10)*10;
+
+  // Fall death (check world y vs camera bottom)
+  if(b.y-cameraY>H+80){
+    gameState='dead';sfx('die');
+    if(score>highScore)highScore=score;
+    document.getElementById('overlay').classList.add('active');
+    document.getElementById('ov-title').textContent='😢 掉下去了！';
+    document.getElementById('ov-msg').textContent='得分：'+score+'\n最高分：'+highScore;
+    document.getElementById('ov-btn').textContent='再玩一次';
+  }
+
+  // Generate new platforms
+  ensurePlatforms();
+
+  // Update particles
+  updateParticles();
+}
+
+function render(){
+  // Sky gradient
+  const grad=ctx.createLinearGradient(0,0,0,H);
+  grad.addColorStop(0,'#87CEEB');grad.addColorStop(0.5,'#B0E0E6');grad.addColorStop(1,'#E0F7FA');
+  ctx.fillStyle=grad;ctx.fillRect(0,0,W,H);
+
+  // Clouds
+  ctx.fillStyle='rgba(255,255,255,.7)';
+  [[100,120],[300,80],[50,200],[250,180],[150,300]].forEach(([cx,cy],i)=>{
+    const sx=cx+Math.sin(gameFrame*0.01+i)*10;
+    const sy=cy-cameraY*0.15;
+    if(sy<-50||sy>H+50)return;
+    ctx.beginPath();ctx.arc(sx,sy,22,0,Math.PI*2);ctx.fill();
+    ctx.beginPath();ctx.arc(sx-18,sy+5,16,0,Math.PI*2);ctx.fill();
+    ctx.beginPath();ctx.arc(sx+18,sy+5,16,0,Math.PI*2);ctx.fill();
+  });
+
+  // Stars (decorative bg)
+  drawStars();
+
+  // Platforms
+  platforms.forEach(p=>{
+    const drawY=p.y-cameraY;
+    if(drawY<-30||drawY>H+30)return;
+    drawPlatform(p,drawY);
+  });
+
+  // Bunny
+  const b=bunny;
+  drawBunny(b.x,b.y-cameraY,b.w,b.h,b.face,b.walkFrame,gameState==='dead');
+
+  // Particles
+  particles.forEach(p=>{
+    ctx.globalAlpha=p.life/p.maxLife;
+    ctx.fillStyle=p.color;
+    ctx.beginPath();ctx.arc(p.x,p.y-cameraY,p.size,0,Math.PI*2);ctx.fill();
+  });
+  ctx.globalAlpha=1;
+
+  // Score display
+  document.getElementById('score').textContent=score;
+}
+
+function gameLoop(){
+  update();render();
+  requestAnimationFrame(gameLoop);
+}
+
+// ========== GAME CONTROL ==========
+function startGame(){
+  initAudio();
+  bunny.x=W/2-bunny.w/2;bunny.y=H*0.3;bunny.dx=0;bunny.dy=0;
+  bunny.face=1;bunny.walkFrame=0;bunny.onPlatform=false;
+  cameraY=0;score=0;minY=H*0.3;gameFrame=0;
+  platforms=generatePlatforms(20,0);
+  // Ensure a platform directly under bunny
+  platforms.unshift({x:bunny.x-20,y:bunny.y+bunny.h+20,w:80,h:14,type:PTYPE.NORMAL,broken:false,moveDir:0,moveRange:0,startX:0});
+  // Generate background stars
+  stars=[];for(let i=0;i<40;i++)stars.push({x:rand(10,W-10),y:rand(-400,200),r:rand(1,2.5)});
+  particles=[];
+  gameState='playing';
+  document.getElementById('overlay').classList.remove('active');
+}
+
+// ========== INPUT ==========
+window.addEventListener('keydown',e=>{
+  keys[e.key]=true;initAudio();
+  if(e.key==='ArrowUp'||e.key==='ArrowDown'||e.key===' ')e.preventDefault();
+  if(gameState==='dead')startGame();
+});
+window.addEventListener('keyup',e=>{keys[e.key]=false});
+
+['btn-left','btn-right'].forEach((id,i)=>{
+  const el=document.getElementById(id);
+  el.addEventListener('pointerdown',e=>{e.preventDefault();initAudio();btns[i===0?'left':'right']=true;if(gameState==='dead')startGame()});
+  el.addEventListener('touchstart',e=>{e.preventDefault();initAudio();btns[i===0?'left':'right']=true;if(gameState==='dead')startGame()});
+  el.addEventListener('pointerup',e=>{e.preventDefault();btns[i===0?'left':'right']=false});
+  el.addEventListener('touchend',e=>{e.preventDefault();btns[i===0?'left':'right']=false});
+  el.addEventListener('pointerleave',e=>{btns[i===0?'left':'right']=false});
+});
+
+// ========== INIT ==========
+platforms=generatePlatforms(20,0);
+stars=[];for(let i=0;i<40;i++)stars.push({x:rand(10,W-10),y:rand(-400,200),r:rand(1,2.5)});
+showOverlay();
+function showOverlay(){
+  document.getElementById('ov-title').textContent='🐰 蹦蹦跳大冒险';
+  document.getElementById('ov-msg').textContent='一直往上跳，别掉下去！\n最高分：'+highScore;
+  document.getElementById('ov-btn').textContent='开始游戏';
+  document.getElementById('overlay').classList.add('active');
+}
+document.getElementById('ov-btn').addEventListener('click',startGame);
+C.addEventListener('click',()=>{if(gameState==='dead')startGame()});
+gameLoop();
+</script>
+</body>
+</html>
